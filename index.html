@@ -3689,7 +3689,8 @@ function cleanMusicFavs(arr){
 
 // 推送本地收藏到云端（REPLACE 策略：直接覆盖，确保取消收藏能同步删除）
 async function cloudPushFavorites(){
-  if(!cloudReady) return false;
+  if(!cloudReady){ console.warn('[云端同步] cloudPushFavorites 跳过: cloudReady=false'); return false; }
+  console.log('[云端同步] cloudPushFavorites 开始执行');
   return cloudAtomic(async function(data){
     if(!data._favorites) data._favorites = { photos: [], music: [] };
     // 图片收藏：本地直接覆盖云端
@@ -3773,19 +3774,27 @@ async function cloudPullFavorites(){
       MUSIC_FAV_HOOK.setDeleted(sync.del);
       changed += sync.music.length;
       if(typeof MUSIC_FAV_HOOK.refresh === 'function') MUSIC_FAV_HOOK.refresh();
-      // ★ 回推云端：拉取合并后，把本端独有的收藏立即写回云端
-      // 解决"PC 有收藏但云端为空 → 手机拉到空 → 永远不同步"的核心问题
-      // 不再依赖"启动对账推送"这个脆弱的单次窗口——每次拉取都是双向同步
-      if(sync.music.length > 0 && cloudReady){
+      // ★ 回推云端：只要本端有收藏数据就立即写回云端（打破两端均为空的死锁）
+      // 上一版条件 sync.music.length>0 在"手机端无本地收藏+云端也为空"时永远为 false 导致死锁
+      // 改为检查本端原始 favorites，确保 PC/任意有收藏的端打开即能推送
+      var _localFavs = (MUSIC_FAV_HOOK.getFavs ? MUSIC_FAV_HOOK.getFavs() : []);
+      if(_localFavs.length > 0 && cloudReady){
         (function(){
-          var merged = sync.music;
-          var mergedDel = sync.del;
+          var _toPush = _localFavs;
+          var _localDel = (MUSIC_FAV_HOOK.getDeleted ? MUSIC_FAV_HOOK.getDeleted() : []);
+          console.log('[云端同步] 本端有 '+_localFavs.length+' 首收藏，回推云端');
           cloudAtomic(function(pd){
             if(!pd._favorites) pd._favorites = { photos:[], music:[] };
-            pd._favorites.music = merged.map(function(s){ return { url:s.url||'', title:s.title||'', singer:s.singer||'', cover:s.cover||'', id:String(s.id||''), type:s.type||'', base64:s.base64||'', ts:s.ts||0 }; });
-            if(mergedDel && mergedDel.length > 0) pd._favorites.musicDel = mergedDel;
+            // 用本端收藏与云端做 LWW 合并（不盲目覆盖云端已有数据）
+            if(MUSIC_FAV_HOOK && typeof MUSIC_FAV_HOOK.computeSync === 'function'){
+              var _s = MUSIC_FAV_HOOK.computeSync(pd._favorites.music || [], pd._favorites.musicDel || []);
+              pd._favorites.music = _s.music.map(function(s){ return { url:s.url||'', title:s.title||'', singer:s.singer||'', cover:s.cover||'', id:String(s.id||''), type:s.type||'', base64:s.base64||'', ts:s.ts||0 }; });
+              if(_s.del && _s.del.length > 0) pd._favorites.musicDel = _s.del;
+            } else {
+              pd._favorites.music = _toPush.map(function(s){ return { url:s.url||'', title:s.title||'', singer:s.singer||'', cover:s.cover||'', id:String(s.id||''), type:s.type||'', base64:s.base64||'', ts:s.ts||0 }; });
+            }
             return true;
-          }).catch(function(){});
+          }).then(function(ok){ if(ok) console.log('[云端同步] 收藏回推云端成功'); }).catch(function(e){ console.warn('[云端同步] 收藏回推失败', e); });
         })();
       }
     }
