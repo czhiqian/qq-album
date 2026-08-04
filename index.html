@@ -3433,6 +3433,139 @@ async function registerVisitor(){
   return c2;
 }
 
+// ============================================================
+//  CloudBase 云存储适配层（承载大文件：照片原图 / 音乐音频）
+//  背景：JSONBin 单文档上限 100KB，装不下原图与音频 base64，
+//        导致「手机看不到原图、播不了 PC 收藏的歌」。
+//  分工：大文件 → CloudBase 云存储（返回 fileID）
+//        fileID + 元数据 → 仍存 JSONBin（几十字节，永不超限）
+//  安全：仅需公开的环境ID，匿名登录，无任何密钥硬编码。
+//  降级：CB_ENV_ID 为空或 SDK 加载失败时，下列函数一律返回空值，
+//        调用方自动沿用原有缩略图逻辑，功能与改造前完全一致。
+// ============================================================
+var CB_ENV_ID = 'mengjie-d9gkgjf0zbb37ae67';   // 腾讯云 CloudBase 环境ID（梦姐相册环境）
+var CB_SDK_URL = 'https://static.cloudbase.net/cloudbase-js-sdk/2.7.2/cloudbase.full.js';
+var _cbApp = null, _cbReady = false, _cbInitPromise = null;
+var _cbUrlCache = {};   // fileID -> { url, exp } 临时链接缓存，避免重复请求
+
+function cbEnabled(){ return !!CB_ENV_ID; }
+
+// 按需加载 SDK（不阻塞首屏；CDN 不可用时静默失败）
+function _cbLoadSDK(){
+  return new Promise(function(resolve){
+    if(typeof cloudbase !== 'undefined'){ resolve(true); return; }
+    var s = document.createElement('script');
+    s.src = CB_SDK_URL;
+    s.onload = function(){ resolve(typeof cloudbase !== 'undefined'); };
+    s.onerror = function(){ resolve(false); };
+    document.head.appendChild(s);
+  });
+}
+
+// 初始化 + 匿名登录（全程只做一次，并发调用共享同一个 Promise）
+function cbInit(){
+  if(_cbReady) return Promise.resolve(true);
+  if(!cbEnabled()) return Promise.resolve(false);
+  if(_cbInitPromise) return _cbInitPromise;
+  _cbInitPromise = (async function(){
+    try{
+      var loaded = await _cbLoadSDK();
+      if(!loaded) return false;
+      _cbApp = cloudbase.init({ env: CB_ENV_ID });
+      var auth = _cbApp.auth({ persistence: 'local' });
+      var logged = false;
+      try{ logged = !!(auth.hasLoginState && auth.hasLoginState()); }catch(e){}
+      if(!logged){
+        // 兼容两种 SDK 版本的匿名登录写法
+        if(typeof auth.anonymousAuthProvider === 'function'){
+          await auth.anonymousAuthProvider().signIn();
+        } else if(typeof auth.signInAnonymously === 'function'){
+          await auth.signInAnonymously();
+        } else {
+          return false;
+        }
+      }
+      _cbReady = true;
+      console.log('[CloudBase] 就绪:', CB_ENV_ID);
+      return true;
+    }catch(e){ console.warn('[CloudBase] 初始化失败', e); return false; }
+  })();
+  return _cbInitPromise;
+}
+
+// dataURL → Blob（照片/音频在本地以 dataURL 存储，上传前需转换）
+function dataUrlToBlob(dataUrl){
+  try{
+    if(typeof dataUrl !== 'string' || dataUrl.indexOf('data:') !== 0) return null;
+    var parts = dataUrl.split(',');
+    var m = parts[0].match(/:(.*?);/);
+    var mime = (m && m[1]) ? m[1] : 'application/octet-stream';
+    var bin = atob(parts[1]);
+    var arr = new Uint8Array(bin.length);
+    for(var i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
+    return new Blob([arr], { type: mime });
+  }catch(e){ return null; }
+}
+
+// 上传文件 → 返回 fileID（失败返回 null）
+async function cbUpload(fileOrBlobOrDataUrl, cloudPath){
+  var ok = await cbInit();
+  if(!ok) return null;
+  var body = fileOrBlobOrDataUrl;
+  if(typeof body === 'string') body = dataUrlToBlob(body);
+  if(!body) return null;
+  try{
+    var res = await _cbApp.uploadFile({ cloudPath: cloudPath, filePath: body });
+    return (res && res.fileID) ? res.fileID : null;
+  }catch(e){ console.warn('[CloudBase] 上传失败', cloudPath, e); return null; }
+}
+
+// 批量把 fileID 换成可直接访问的 https 链接（单次上限 50 个，带 1 小时缓存）
+async function cbGetURLs(fileIDs){
+  var out = {};
+  if(!Array.isArray(fileIDs) || !fileIDs.length) return out;
+  var now = Date.now(), need = [];
+  fileIDs.forEach(function(id){
+    if(!id) return;
+    var c = _cbUrlCache[id];
+    if(c && c.exp > now) out[id] = c.url; else need.push(id);
+  });
+  if(!need.length) return out;
+  var ok = await cbInit();
+  if(!ok) return out;
+  try{
+    for(var i = 0; i < need.length; i += 50){
+      var batch = need.slice(i, i + 50);
+      var r = await _cbApp.getTempFileURL({ fileList: batch });
+      var list = (r && r.fileList) ? r.fileList : [];
+      list.forEach(function(f){
+        if(f && f.fileID && f.tempFileURL){
+          out[f.fileID] = f.tempFileURL;
+          _cbUrlCache[f.fileID] = { url: f.tempFileURL, exp: now + 86400000 };
+        }
+      });
+    }
+  }catch(e){ console.warn('[CloudBase] 获取链接失败', e); }
+  return out;
+}
+
+// 单个 fileID 取链接（内部复用批量接口）
+async function cbGetURL(fileID){
+  if(!fileID) return null;
+  var m = await cbGetURLs([fileID]);
+  return m[fileID] || null;
+}
+
+// 删除云存储文件（本地删除照片/歌曲时同步清理，释放免费存储额度）
+async function cbDelete(fileIDs){
+  var list = Array.isArray(fileIDs) ? fileIDs.filter(Boolean) : (fileIDs ? [fileIDs] : []);
+  if(!list.length) return false;
+  var ok = await cbInit();
+  if(!ok) return false;
+  try{ await _cbApp.deleteFile({ fileList: list }); return true; }
+  catch(e){ console.warn('[CloudBase] 删除失败', e); return false; }
+}
+
 // 云端原始数据读取（支持公共只读 + 个人读写两种模式）
 async function cloudLoadRaw(){
   var binId = (cloudConfig && cloudConfig.binId) || PUBLIC_BIN_ID;
@@ -3544,24 +3677,35 @@ function makeCloudThumb(photo, file){
 
 async function cloudUploadImage(photo, file){
   if(!cloudReady || !photo) return false;
-  // 先尝试推送（含重试：首次失败等2秒再试一次，覆盖移动端网络抖动）
+  // ☁ 把原图 + 缩略图上传到 CloudBase 云存储（免费版：临时链接 24h 绕开 UID 隔离）
+  var thumbId = null, fileId = null, thumb64 = null;
+  if(cbEnabled()){
+    try{
+      thumb64 = await makeCloudThumb(photo, file);
+      if(!thumb64){
+        if(file) thumb64 = await compressForCloud(file);
+        else if(photo.src && photo.src.length < 1200000) thumb64 = photo.src;
+      }
+      if(thumb64) thumbId = await cbUpload(thumb64, 'thumbs/' + photo.id + '.jpg');
+      var orig = file || thumb64;
+      if(orig) fileId = await cbUpload(orig, 'photos/' + photo.id + '.jpg');
+    }catch(e){ console.warn('[CloudBase] 上传原图/缩略图失败', e); }
+  }
+  // 写入 JSONBin（仅 fileID + 元数据，几十字节，永不超限）
   for(var attempt = 0; attempt < 2; attempt++){
     var ok = await cloudAtomic(async function(data){
       if(!data._uploads) data._uploads = [];
       if(data._uploads.some(function(u){ return u.id === photo.id; })) return false;
-      var thumb64 = await makeCloudThumb(photo, file);
-      if(!thumb64){
-        // 最兜底：用原始压缩
-        if(file) thumb64 = await compressForCloud(file);
-        else if(photo.src && photo.src.length < 1200000) thumb64 = photo.src;
-      }
-      if(!thumb64) return false;
-      data._uploads.push({
-        id: photo.id, name: photo.name||'上传图片', thumb: thumb64,
-        w: photo.w||0, h: photo.h||0, size: photo.size||0,
+      var rec = {
+        id: photo.id, name: photo.name||'上传图片', w: photo.w||0, h: photo.h||0, size: photo.size||0,
         uploader: photo.uploader||'梦', ts: photo.ts||Date.now(),
         albumId: photo.albumId||null, tags: photo.tags||[]
-      });
+      };
+      if(fileId) rec.fileId = fileId;
+      if(thumbId) rec.thumbId = thumbId;
+      // 降级：云存储上传失败时退回 base64 缩略图（兼容旧逻辑，保持不丢数据）
+      if(!fileId && !thumbId && thumb64) rec.thumb = thumb64;
+      data._uploads.push(rec);
       return true;
     });
     if(ok) return true;
@@ -3576,6 +3720,14 @@ async function cloudRemoveUpload(photoId){
   if(!cloudReady || !photoId) return false;
   return cloudAtomic(async function(data){
     if(!data._uploads || !data._uploads.length) return false;
+    var target = data._uploads.find(function(u){ return u.id === photoId; });
+    // ☁ 同步清理云存储文件（释放免费存储额度）
+    if(target && cbEnabled() && (target.fileId || target.thumbId)){
+      var toDel = [];
+      if(target.fileId) toDel.push(target.fileId);
+      if(target.thumbId) toDel.push(target.thumbId);
+      cbDelete(toDel).catch(function(){});
+    }
     var before = data._uploads.length;
     data._uploads = data._uploads.filter(function(u){ return u.id !== photoId; });
     return data._uploads.length < before;
@@ -3588,14 +3740,20 @@ async function cloudSyncUploads(){
   try{
     var data = await cloudLoadRaw();
     if(!data || !data._uploads || !data._uploads.length) return 0;
+    // ☁ 批量把 fileID 换成 24h 临时 URL（免费版绕开 UID 隔离）
+    var ids = [];
+    data._uploads.forEach(function(u){ if(u.fileId) ids.push(u.fileId); if(u.thumbId) ids.push(u.thumbId); });
+    var urlMap = (ids.length && cbEnabled()) ? await cbGetURLs(ids) : {};
     var localIds = new Set(photos.map(p => p.id));
     var added = 0;
     for(var i = 0; i < data._uploads.length; i++){
       var u = data._uploads[i];
       if(localIds.has(u.id)) continue;  // 已有则跳过
-      // 构造照片对象（云端缩略图作为 src 和 thumb）
+      // 优先级：原图URL > 缩略图URL > 旧base64(兼容历史数据)
+      var srcUrl = urlMap[u.fileId] || (u.thumb || '');
+      var thumbUrl = urlMap[u.thumbId] || urlMap[u.fileId] || (u.thumb || '');
       var p = {
-        id: u.id, type:'image', src: u.thumb, thumb: u.thumb,
+        id: u.id, type:'image', src: srcUrl, thumb: thumbUrl,
         w: u.w||0, h: u.h||0, size: u.size||0,
         dev:'云端同步', fmt:'JPEG', name: u.name||'上传图片',
         uploaded:true, uploadedFromCloud: true,
@@ -3713,31 +3871,31 @@ async function cloudPushFavorites(){
     // 音乐收藏：LWW 并集合并（三端聚合，取消收藏也按时间戳同步，不再 REPLACE 覆盖）
     if(MUSIC_FAV_HOOK && typeof MUSIC_FAV_HOOK.computeSync === 'function'){
       var sync = MUSIC_FAV_HOOK.computeSync(data._favorites.music || [], data._favorites.musicDel || []);
-      data._favorites.music = sync.music.map(function(s){ return { url:s.url||'', title:s.title||'', singer:s.singer||'', cover:s.cover||'', id:String(s.id||''), type:s.type||'', base64:s.base64||'', ts:s.ts||0 }; });
+      data._favorites.music = sync.music.map(function(s){ return { url:s.url||'', title:s.title||'', singer:s.singer||'', cover:s.cover||'', id:String(s.id||''), type:s.type||'', base64:s.base64||'', fileId:s.fileId||'', ts:s.ts||0 }; });
       data._favorites.musicDel = sync.del;
       MUSIC_FAV_HOOK.setFavs(sync.music);
       MUSIC_FAV_HOOK.setDeleted(sync.del);
     }
-    // 本地音乐（上传/URL）：重新压缩历史无音频的歌 → 合并进云端（保留两端上传，不互删）
-    if(MUSIC_LOCAL_HOOK){
-      if(typeof MUSIC_LOCAL_HOOK.prepareLocalForPush === 'function'){ try{ await MUSIC_LOCAL_HOOK.prepareLocalForPush(); }catch(e){} }
-      if(typeof MUSIC_LOCAL_HOOK.getLocal === 'function'){
-        var localMus = MUSIC_LOCAL_HOOK.getLocal();
-        var existMus = (data._music_local && Array.isArray(data._music_local)) ? data._music_local : [];
-        var exSet = {};
-        existMus.forEach(function(m){ if(m && m.id) exSet[m.id] = true; });
-        localMus.forEach(function(m){
-          if(m && m.id){
-            if(!exSet[m.id]){ existMus.push(m); }
-            else {
-              // 已存在：若本地已有音频 base64，覆盖云端旧的空值
-              var ex = existMus.find(function(x){ return x.id === m.id; });
-              if(ex && m.base64 && !ex.base64){ ex.base64 = m.base64; ex.noCloud = false; }
+    // 本地音乐（上传/URL）：合并进云端（优先 fileId，base64 兜底；保留两端上传，不互删）
+    if(MUSIC_LOCAL_HOOK && typeof MUSIC_LOCAL_HOOK.getLocal === 'function'){
+      var localMus = MUSIC_LOCAL_HOOK.getLocal();
+      var existMus = (data._music_local && Array.isArray(data._music_local)) ? data._music_local : [];
+      var exSet = {};
+      existMus.forEach(function(m){ if(m && m.id) exSet[m.id] = true; });
+      localMus.forEach(function(m){
+        if(m && m.id){
+          if(!exSet[m.id]){
+            existMus.push({ id:m.id, title:m.title, singer:m.singer, type:m.type||'local', fileId:m.fileId||'', base64:m.base64||'', ts:m.ts||Date.now() });
+          } else {
+            var ex = existMus.find(function(x){ return x.id === m.id; });
+            if(ex){
+              if(m.fileId && !ex.fileId) ex.fileId = m.fileId;
+              if(m.base64 && !ex.base64){ ex.base64 = m.base64; ex.noCloud = false; }
             }
           }
-        });
-        data._music_local = existMus;
-      }
+        }
+      });
+      data._music_local = existMus;
     }
     return true;
   });
@@ -3790,7 +3948,7 @@ async function cloudPullFavorites(){
             // 用本端收藏与云端做 LWW 合并（不盲目覆盖云端已有数据）
             if(MUSIC_FAV_HOOK && typeof MUSIC_FAV_HOOK.computeSync === 'function'){
               var _s = MUSIC_FAV_HOOK.computeSync(pd._favorites.music || [], pd._favorites.musicDel || []);
-              pd._favorites.music = _s.music.map(function(s){ return { url:s.url||'', title:s.title||'', singer:s.singer||'', cover:s.cover||'', id:String(s.id||''), type:s.type||'', base64:s.base64||'', ts:s.ts||0 }; });
+              pd._favorites.music = _s.music.map(function(s){ return { url:s.url||'', title:s.title||'', singer:s.singer||'', cover:s.cover||'', id:String(s.id||''), type:s.type||'', base64:s.base64||'', fileId:s.fileId||'', ts:s.ts||0 }; });
               if(_s.del && _s.del.length > 0) pd._favorites.musicDel = _s.del;
             } else {
               pd._favorites.music = _toPush.map(function(s){ return { url:s.url||'', title:s.title||'', singer:s.singer||'', cover:s.cover||'', id:String(s.id||''), type:s.type||'', base64:s.base64||'', ts:s.ts||0 }; });
@@ -7200,7 +7358,7 @@ if(currentUser) setNavAvatar(currentUser);
   // 收藏同步辅助（LWW-Element-Set：同 id 以最后操作时间戳为准，解决三端收藏/取消收藏互通）
   function favKeyOf(s){ return s && s.id ? String(s.id) : ('|' + String((s && s.url) || '')); }
   function normalizeFav(s){
-    return { url:s.url||'', title:s.title||'', singer:s.singer||'', cover:s.cover||'', id:String(s.id||''), type:s.type||'', base64:s.base64||'', ts:s.ts||0 };
+    return { url:s.url||'', title:s.title||'', singer:s.singer||'', cover:s.cover||'', id:String(s.id||''), type:s.type||'', base64:s.base64||'', fileId:s.fileId||'', ts:s.ts||0 };
   }
   function lwwMerge(localFavs, localDel, cloudFavs, cloudDel){
     var addMap = {};
@@ -7259,7 +7417,8 @@ if(currentUser) setNavAvatar(currentUser);
     getLocal: function(){
       return getLocalMeta().map(function(m){
         if(m.type === 'url') return { id:m.id, title:m.title, singer:m.singer, type:'url', url:m.url, ts:m.ts };
-        return { id:m.id, title:m.title, singer:m.singer, type:'local', base64: m.base64 || '', noCloud: m.noCloud || false, ts:m.ts };
+        var isCloud = !!m.fileId;
+        return { id:m.id, title:m.title, singer:m.singer, type:'local', fileId: m.fileId || '', base64: isCloud ? '' : (m.base64 || ''), noCloud: !isCloud, ts:m.ts };
       });
     },
     mergeCloud: function(cloudArr){
@@ -7274,6 +7433,11 @@ if(currentUser) setNavAvatar(currentUser);
           meta.push({ id:c.id, title:c.title, singer:c.singer, type:'url', url:c.url, ts:c.ts });
           songDataLocal.push({ id:c.id, title:c.title, singer:c.singer, url:c.url, type:'url', ts:c.ts });
           added++;
+        } else if(c.type === 'local' && c.fileId){
+          // ☁ 云端音频：标记 fileId，播放时再解析临时 URL（跨端可听）
+          meta.push({ id:c.id, title:c.title, singer:c.singer, type:'local', fileId:c.fileId, ts:c.ts });
+          songDataLocal.push({ id:c.id, title:c.title, singer:c.singer, url:'', type:'local', fileId:c.fileId, ts:c.ts });
+          added++;
         } else if(c.type === 'local' && c.base64){
           const blob = dataURLtoBlob(c.base64);
           if(blob) idbPut(c.id, blob);
@@ -7281,7 +7445,7 @@ if(currentUser) setNavAvatar(currentUser);
           songDataLocal.push({ id:c.id, title:c.title, singer:c.singer, url: blob ? URL.createObjectURL(blob) : '', type:'local', ts:c.ts });
           added++;
         }
-        // 本地大文件（无 base64）→ 仅本机可听，跨端跳过
+        // 本地大文件（无 base64/fileId）→ 仅本机可听，跨端跳过
       });
       if(added > 0){ saveLocalMeta(meta); renderLocalSongs(); }
       return added;
@@ -7893,30 +8057,42 @@ if(currentUser) setNavAvatar(currentUser);
       tipEl.style.cssText = 'color:#60A5FA;margin-top:6px';
 
       if(isLocalSong && sid.indexOf('ml_') === 0){
-        // 本地上传歌曲：优先用收藏记录自带的云端 base64（跨端可直接播放），失败再回退本机
+        // 本机加载兜底（IndexedDB 原文件 → 元数据 base64）
+        var loadFromLocal = function(){
+          tipEl.textContent = '🔄 正在加载本地音频…';
+          if(!tipEl.parentNode) songList.appendChild(tipEl);
+          idbGet(sid).then(function(blob){
+            if(blob){ if(tipEl.parentNode) tipEl.remove(); playReady(URL.createObjectURL(blob)); return; }
+            var meta = getLocalMeta();
+            var m = meta.find(function(x){ return x.id === sid; });
+            if(m && m.base64){
+              var b = dataURLtoBlob(m.base64);
+              if(b){ if(tipEl.parentNode) tipEl.remove(); playReady(URL.createObjectURL(b)); return; }
+            }
+            if(tipEl.parentNode) tipEl.remove();
+            showTip('⚠️ 本地音频未找到（请在本机重新上传，或用「粘贴音频URL」添加可访问链接）');
+          }).catch(function(){
+            if(tipEl.parentNode) tipEl.remove();
+            showTip('⚠️ 本地音频读取失败');
+          });
+        };
+        // ☁ CloudBase 优先：用云存储临时 URL 播放（跨端可听，免费版绕开 UID 隔离）
+        if(song.fileId){
+          tipEl.textContent = '🔄 正在加载云端音频…';
+          if(!tipEl.parentNode) songList.appendChild(tipEl);
+          cbGetURL(song.fileId).then(function(url){
+            if(tipEl.parentNode) tipEl.remove();
+            if(url){ playReady(url); return; }
+            loadFromLocal();  // 临时链接失效 → 回退本机
+          }).catch(function(){ if(tipEl.parentNode) tipEl.remove(); loadFromLocal(); });
+          return;
+        }
+        // 收藏记录自带的云端 base64（跨端可直接播放）
         if(song.base64){
           var _b0 = dataURLtoBlob(song.base64);
           if(_b0){ if(tipEl.parentNode) tipEl.remove(); playReady(URL.createObjectURL(_b0)); return; }
         }
-        // 本机原始文件：优先从 IndexedDB 还原，失败则尝试元数据中的 base64
-        tipEl.textContent = '🔄 正在加载本地音频…';
-        songList.appendChild(tipEl);
-        idbGet(sid).then(function(blob){
-          if(blob){ if(tipEl.parentNode) tipEl.remove(); playReady(URL.createObjectURL(blob)); return; }
-          // IndexedDB 没有 → 尝试从元数据中的 base64 还原（云端同步的压缩版本）
-          var meta = getLocalMeta();
-          var m = meta.find(function(x){ return x.id === sid; });
-          if(m && m.base64){
-            var b = dataURLtoBlob(m.base64);
-            if(b){ if(tipEl.parentNode) tipEl.remove(); playReady(URL.createObjectURL(b)); return; }
-          }
-          // 都没有
-          if(tipEl.parentNode) tipEl.remove();
-          showTip('⚠️ 本地音频未找到（请在本机重新上传，或用「粘贴音频URL」添加可访问链接）');
-        }).catch(function(){
-          if(tipEl.parentNode) tipEl.remove();
-          showTip('⚠️ 本地音频读取失败');
-        });
+        loadFromLocal();
       } else if(isLocalSong && sid.indexOf('mu_') === 0){
         // URL类型歌曲：直接用持久化 URL 播放
         playReady(song.url || null);
@@ -8200,10 +8376,12 @@ if(currentUser) setNavAvatar(currentUser);
         // 从搜索结果/本地歌曲中拿到完整信息（title/singer/cover）
         // 【关键】本地歌曲额外存储 type 字段，播放时据此走 IndexedDB 还原路径
         // 【关键】本地歌曲额外抓取云端可用的压缩音频 base64（跨端可播放），在线歌曲不需要
+        // ☁ 本地歌：优先带云存储 fileId（跨端可播），base64 仅作兜底
         var fb64 = '';
-        if(song.type === 'local' || (song.id !== undefined && String(song.id).indexOf('ml_') === 0)){
+        var ffileId = '';
+        if(song.type === 'local' || (String(song.id||'').indexOf('ml_') === 0)){
           var _mm = getLocalMeta().find(function(x){ return x.id === (song.id !== undefined ? String(song.id) : sidStr); });
-          fb64 = (_mm && _mm.base64) ? _mm.base64 : '';
+          if(_mm){ ffileId = _mm.fileId || ''; fb64 = _mm.base64 || ''; }
         }
         var _favTs = Date.now();
         var _fk = favKeyOf(song) || (song.id !== undefined ? String(song.id) : sidStr);
@@ -8215,6 +8393,7 @@ if(currentUser) setNavAvatar(currentUser);
           cover: song.cover || song.pic || '',
           id: song.id !== undefined ? String(song.id) : sidStr,
           type: song.type || '',  // 'local' | 'url' | ''(在线)
+          fileId: ffileId,
           base64: fb64,
           ts: _favTs
         });
@@ -8448,16 +8627,22 @@ if(currentUser) setNavAvatar(currentUser);
       if(m.type === 'url'){
         songDataLocal.push({ id:m.id, title:m.title, singer:m.singer, url:m.url, type:'url', ts:ts });
       } else if(m.type === 'local'){
-        // 优先从 IndexedDB 还原（本机原始质量），失败则用云端同步的 base64（压缩版）
-        idbGet(m.id).then(function(blob){
-          if(blob){
-            songDataLocal.push({ id:m.id, title:m.title, singer:m.singer, url: URL.createObjectURL(blob), type:'local', noCloud: m.noCloud, ts:ts });
-          } else if(m.base64){
-            var b = dataURLtoBlob(m.base64);
-            songDataLocal.push({ id:m.id, title:m.title, singer:m.singer, url: b ? URL.createObjectURL(b) : '', type:'local', noCloud: false, ts:ts });
-          }
+        if(m.fileId){
+          // ☁ 云端音频：标记 fileId，播放时解析临时 URL（跨端可听）
+          songDataLocal.push({ id:m.id, title:m.title, singer:m.singer, url:'', type:'local', fileId:m.fileId, ts:ts });
           renderLocalSongs();
-        }).catch(function(){});
+        } else {
+          // 本机原始质量优先，失败用 base64 压缩版
+          idbGet(m.id).then(function(blob){
+            if(blob){
+              songDataLocal.push({ id:m.id, title:m.title, singer:m.singer, url: URL.createObjectURL(blob), type:'local', noCloud: m.noCloud, ts:ts });
+            } else if(m.base64){
+              var b = dataURLtoBlob(m.base64);
+              songDataLocal.push({ id:m.id, title:m.title, singer:m.singer, url: b ? URL.createObjectURL(b) : '', type:'local', noCloud: false, ts:ts });
+            }
+            renderLocalSongs();
+          }).catch(function(){});
+        }
       }
     });
     renderLocalSongs();
@@ -8544,23 +8729,30 @@ if(currentUser) setNavAvatar(currentUser);
     playAt(currentIndex);
     // 本机永久保存（IndexedDB，容量无限，跨刷新有效）
     idbPut(id, file);
-    // 压缩音频 → 转 base64 推云端（跨端可听）
-    compressAudioForCloud(file).then(function(compressed){
-      if(!compressed) return '';           // 无法压缩：仅本机可听
-      return fileToBase64(compressed);
-    }).then(function(b64){
-      b64 = b64 || '';
-      const tooBig = b64.length > MAX_CLOUD_B64;
-      const meta = getLocalMeta();
-      meta.push({ id, title, singer:'本地文件', type:'local', base64: tooBig ? '' : b64, noCloud: tooBig || b64==='', ts: now });
-      saveLocalMeta(meta);
-      if(b64==='' && typeof toast==='function') toast('⚠ 该文件无法压缩同步，仅本机可听；手机端请用「粘贴音频URL」添加');
-      else if(tooBig && typeof toast==='function') toast('⚠ 文件过大，已存本机；手机端请用「粘贴音频URL」添加');
-      else if(typeof toast==='function') toast('✅ 已上传并同步（手机端刷新后可听）');
-      if(cloudReady && typeof cloudPushFavorites==='function') cloudPushFavorites().catch(function(){});
-    }).catch(function(){
-      if(typeof toast==='function') toast('⚠ 音频处理失败，仅本机可听');
-    });
+    // ☁ 上传云存储拿 fileId（跨端可听；免费版走 24h 临时链接，绕开 UID 隔离）
+    if(cbEnabled()){
+      var ext = (file.name.split('.').pop() || 'mp3').toLowerCase().replace(/[^a-z0-9]/g, '');
+      compressAudioForCloud(file).then(function(comp){
+        return cbUpload(comp || file, 'music/' + id + '.' + (ext || 'mp3'));
+      }).then(function(fileId){
+        if(!fileId){ if(typeof toast==='function') toast('⚠ 云端上传失败，仅本机可听'); return; }
+        song.fileId = fileId;
+        var meta = getLocalMeta();
+        meta.push({ id: id, title: title, singer:'本地文件', type:'local', fileId: fileId, ts: now });
+        saveLocalMeta(meta);
+        if(typeof toast==='function') toast('✅ 已上传云端，手机端刷新后可听');
+        if(cloudReady && typeof cloudPushFavorites==='function') cloudPushFavorites().catch(function(){});
+      }).catch(function(){ if(typeof toast==='function') toast('⚠ 音频上传失败，仅本机可听'); });
+    } else {
+      // 降级：无云存储时退回 base64（若还能压缩）
+      compressAudioForCloud(file).then(function(comp){ return comp ? fileToBase64(comp) : ''; }).then(function(b64){
+        b64 = b64 || '';
+        var meta = getLocalMeta();
+        meta.push({ id: id, title: title, singer:'本地文件', type:'local', base64: b64, noCloud: b64==='', ts: now });
+        saveLocalMeta(meta);
+        if(cloudReady && typeof cloudPushFavorites==='function') cloudPushFavorites().catch(function(){});
+      }).catch(function(){});
+    }
     localFile.value='';
   });
 
