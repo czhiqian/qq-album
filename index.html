@@ -3444,20 +3444,29 @@ async function registerVisitor(){
 //        调用方自动沿用原有缩略图逻辑，功能与改造前完全一致。
 // ============================================================
 var CB_ENV_ID = 'mengjie-d9gkgjf0zbb37ae67';   // 腾讯云 CloudBase 环境ID（梦姐相册环境）
-var CB_SDK_URL = 'https://static.cloudbase.net/cloudbase-js-sdk/2.7.2/cloudbase.full.js';
+// 浏览器 UMD bundle 入口（npm 上的 v2 没有 UMD；只有 static.cloudbase.net 维护的浏览器脚本）
+var CB_SDK_URL = 'https://static.cloudbase.net/cloudbase-js-sdk/latest/cloudbase.full.js';
 var _cbApp = null, _cbReady = false, _cbInitPromise = null;
 var _cbUrlCache = {};   // fileID -> { url, exp } 临时链接缓存，避免重复请求
 
 function cbEnabled(){ return !!CB_ENV_ID; }
 
-// 按需加载 SDK（不阻塞首屏；CDN 不可用时静默失败）
+// 按需加载 SDK（不阻塞首屏；加载结果打印到 console，便于排查）
 function _cbLoadSDK(){
   return new Promise(function(resolve){
     if(typeof cloudbase !== 'undefined'){ resolve(true); return; }
     var s = document.createElement('script');
     s.src = CB_SDK_URL;
-    s.onload = function(){ resolve(typeof cloudbase !== 'undefined'); };
-    s.onerror = function(){ resolve(false); };
+    s.onload = function(){
+      var ok = typeof cloudbase !== 'undefined';
+      if(ok) console.log('[CloudBase] SDK 加载成功 ('+CB_SDK_URL+')');
+      else console.warn('[CloudBase] SDK 加载失败（脚本 onload 了但全局 cloudbase 不存在）');
+      resolve(ok);
+    };
+    s.onerror = function(){
+      console.warn('[CloudBase] SDK 请求失败 404/网络 ('+CB_SDK_URL+')');
+      resolve(false);
+    };
     document.head.appendChild(s);
   });
 }
